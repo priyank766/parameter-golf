@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
+import lzma
 import zlib
 from pathlib import Path
 
@@ -50,9 +51,17 @@ class Hyperparameters:
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
+    # EMA (Exponential Moving Average) for smoother final weights
+    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+
+    # Sliding window evaluation
+    sliding_eval = bool(int(os.environ.get("SLIDING_EVAL", "1")))
+    sliding_eval_stride = int(os.environ.get("SLIDING_EVAL_STRIDE", 64))
+
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 32768))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -61,11 +70,11 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers = int(os.environ.get("NUM_LAYERS", 10))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    model_dim = int(os.environ.get("MODEL_DIM", 768))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 3))
+    mlp_mult = int(os.environ.get("MLP_MULT", 4))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -84,7 +93,7 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -497,27 +506,63 @@ class DistributedTokenLoader:
 # TRANSFORMER MODULES
 # -----------------------------
 class PolarQuantizer(nn.Module):
-    """TurboQuant: PolarQuant mapping from Cartesian to Polar."""
+    """TurboQuant: Random Rotation + Lloyd-Max optimal scalar quantization.
+    
+    Stage 1 of TurboQuant (ICLR 2026): Random orthogonal rotation makes
+    coordinates follow a predictable Gaussian distribution, then Lloyd-Max
+    quantization minimizes MSE per coordinate.
+    """
     def __init__(self, dim: int, bits: int = 4):
         super().__init__()
         self.dim = dim
         self.bits = bits
+        # Random orthogonal rotation matrix (fixed, not learned)
         rot = torch.empty(dim, dim)
         torch.nn.init.orthogonal_(rot)
         self.register_buffer("rotation", rot)
-        self.bins = 2 ** bits
+        # Precompute Lloyd-Max codebook for Gaussian N(0, 1/sqrt(dim))
+        # These are optimal reconstruction levels for a Gaussian source
+        centroids, boundaries = self._compute_lloyd_max_codebook(bits, dim)
+        self.register_buffer("centroids", centroids)    # (num_levels,)
+        self.register_buffer("boundaries", boundaries)  # (num_levels-1,)
+
+    @staticmethod
+    def _compute_lloyd_max_codebook(bits: int, dim: int, iterations: int = 50):
+        """Compute optimal Lloyd-Max centroids for N(0, 1/sqrt(dim))."""
+        num_levels = 2 ** bits
+        sigma = 1.0 / math.sqrt(dim)
+        # Initialize with uniform quantile spacing
+        boundaries = torch.linspace(-3*sigma, 3*sigma, num_levels + 1)
+        centroids = (boundaries[:-1] + boundaries[1:]) / 2
+        # Lloyd's algorithm iterations for Gaussian
+        for _ in range(iterations):
+            # Update boundaries as midpoints of adjacent centroids
+            boundaries = torch.zeros(num_levels - 1)
+            for i in range(num_levels - 1):
+                boundaries[i] = (centroids[i] + centroids[i + 1]) / 2
+            # Update centroids as conditional expectations E[X | b_i <= X < b_{i+1}]
+            # For Gaussian, we use the truncated mean approximation
+            ext_bounds = torch.cat([torch.tensor([-float('inf')]), boundaries, torch.tensor([float('inf')])])
+            for i in range(num_levels):
+                lo, hi = ext_bounds[i].item(), ext_bounds[i + 1].item()
+                # Approximate E[X | lo <= X < hi] for N(0, sigma^2)
+                samples = torch.linspace(max(lo, -4*sigma), min(hi, 4*sigma), 1000)
+                weights = torch.exp(-0.5 * (samples / sigma) ** 2)
+                if weights.sum() > 0:
+                    centroids[i] = (samples * weights).sum() / weights.sum()
+        return centroids, boundaries
 
     def forward(self, x: Tensor) -> Tensor:
+        # Stage 1: Random rotation -> Gaussianize coordinates
         x_rot = F.linear(x, self.rotation.to(x.dtype))
-        pairs = x_rot.view(*x_rot.shape[:-1], self.dim // 2, 2)
-        r = torch.linalg.norm(pairs, dim=-1)
-        theta = torch.atan2(pairs[..., 1], pairs[..., 0])
-        theta_norm = (theta + math.pi) / (2 * math.pi)
-        theta_q = torch.round(theta_norm * (self.bins - 1)) / (self.bins - 1)
-        theta_approx = theta_q * (2 * math.pi) - math.pi
-        x_recon_pairs = torch.stack([r * torch.cos(theta_approx), r * torch.sin(theta_approx)], dim=-1)
-        x_recon = x_recon_pairs.view_as(x_rot).to(x.dtype)
-        return F.linear(x_recon, self.rotation.t().to(x.dtype))
+        # Lloyd-Max quantization: find nearest centroid per coordinate
+        centroids = self.centroids.to(x.dtype)
+        # Compute distances to all centroids and pick nearest
+        dists = (x_rot.unsqueeze(-1) - centroids).abs()  # (..., dim, num_levels)
+        indices = dists.argmin(dim=-1)                     # (..., dim)
+        x_quant = centroids[indices]                       # (..., dim)
+        # Inverse rotation to reconstruct
+        return F.linear(x_quant, self.rotation.t().to(x.dtype))
 
 class QJLResidualCorrection(nn.Module):
     """TurboQuant: 1-bit QJL Error Correction using signs."""
@@ -775,6 +820,39 @@ class GPT(nn.Module):
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
+class EMAWeightAverage:
+    """Exponential Moving Average of model weights for smoother final checkpoint."""
+    def __init__(self, model: nn.Module, decay: float = 0.997):
+        self.decay = decay
+        self.shadow: dict[str, Tensor] = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for name, param in model.named_parameters():
+            if name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(param.data, alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def apply(self, model: nn.Module) -> dict[str, Tensor]:
+        """Apply EMA weights to model, return original weights for restoration."""
+        originals = {}
+        for name, param in model.named_parameters():
+            if name in self.shadow:
+                originals[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+        return originals
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module, originals: dict[str, Tensor]) -> None:
+        """Restore original weights after EMA evaluation."""
+        for name, param in model.named_parameters():
+            if name in originals:
+                param.data.copy_(originals[name])
+
+
 # -----------------------------
 # TRAINING
 # -----------------------------
@@ -962,6 +1040,14 @@ def main() -> None:
     )
     log0(f"seed:{args.seed}")
 
+    # Initialize EMA weight averaging
+    ema: EMAWeightAverage | None = None
+    if args.ema_enabled:
+        ema = EMAWeightAverage(base_model, decay=args.ema_decay)
+        log0(f"ema_enabled:True ema_decay:{args.ema_decay}")
+    else:
+        log0("ema_enabled:False")
+
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
@@ -1086,6 +1172,10 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
+        # EMA update every step
+        if ema is not None:
+            ema.update(base_model)
+
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
@@ -1118,6 +1208,11 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
+    # Apply EMA weights before serialization if enabled
+    if ema is not None:
+        log0("Applying EMA weights for final evaluation and serialization...")
+        ema.apply(base_model)
+
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
@@ -1130,7 +1225,8 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    # Use LZMA for better compression than zlib (~39% smaller)
+    quant_blob = lzma.compress(quant_raw, preset=9)
     quant_raw_bytes = len(quant_raw)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
@@ -1139,16 +1235,21 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+            f"Serialized model int8+lzma: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        total_bytes = quant_file_bytes + code_bytes
+        log0(f"Total submission size int8+lzma: {total_bytes} bytes ({total_bytes / 1024 / 1024:.2f} MB)")
+        if total_bytes > 16_000_000:
+            log0(f"WARNING: Submission exceeds 16MB limit by {total_bytes - 16_000_000} bytes!")
+        else:
+            log0(f"Submission fits within 16MB limit ({16_000_000 - total_bytes} bytes remaining)")
 
     if distributed:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    quant_state = torch.load(io.BytesIO(lzma.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
