@@ -414,8 +414,8 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
             stats["int6_payload_bytes"] += tensor_nbytes(t)
             continue
 
-        # Embeddings and small tensors: keep as fp16
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or "tok_emb" in name:
+        # Embeddings and small tensors: keep as fp16 to prevent destruction
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or "tok_emb" in name or "polar" in name or "qjl" in name:
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
             stats["int6_payload_bytes"] += tensor_nbytes(kept)
