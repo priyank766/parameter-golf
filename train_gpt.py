@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
+import lzma
 import zlib
 from pathlib import Path
 
@@ -26,6 +27,10 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+# Platform detection: Windows lacks Triton and enable_gqa support
+IS_WINDOWS = sys.platform == "win32"
+IS_LINUX = sys.platform == "linux"
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -46,26 +51,39 @@ class Hyperparameters:
     seed = int(os.environ.get("SEED", 1337))
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
-    val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+    val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 32768))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
+    # EMA (Exponential Moving Average) for smoother final weights
+    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+
+    # Sliding window evaluation
+    sliding_eval = bool(int(os.environ.get("SLIDING_EVAL", "1")))
+    sliding_eval_stride = int(os.environ.get("SLIDING_EVAL_STRIDE", 64))
+
+    # QAT (Quantization-Aware Training)
+    qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
+    qat_late_threshold = float(os.environ.get("QAT_LATE_THRESHOLD", 0.15))
+    qat_bits = int(os.environ.get("QAT_BITS", 6))
+
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 32768))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult = int(os.environ.get("MLP_MULT", 3))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -73,18 +91,20 @@ class Hyperparameters:
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.035))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
-    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
+    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.04))
+    adam_weight_decay = float(os.environ.get("ADAM_WEIGHT_DECAY", 0.04))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -321,8 +341,6 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
         clip_abs = (
             torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
             if t32.numel()
@@ -333,11 +351,109 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
         q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
-    # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
     scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
+
+# --- INT6 QUANTIZATION ---
+# 6-bit quantization (range -31..31) for block weights, saving ~25% vs int8
+INT6_MAX_VAL = 31
+INT6_CLIP_PERCENTILES = [0.999, 0.9995, 0.9999, 0.99999, 1.0]
+
+def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
+    """Int6 per-row quantization with GPTQ-lite optimal clip search."""
+    t32 = t.float()
+    if t32.ndim == 2:
+        best_q = None
+        best_scale = None
+        best_mse = float('inf')
+        # GPTQ-lite: try multiple clip percentiles per row, pick min MSE
+        for pct in INT6_CLIP_PERCENTILES:
+            clip_abs = torch.quantile(t32.abs(), pct, dim=1) if t32.numel() else torch.empty((t32.shape[0],), dtype=torch.float32)
+            scale = (clip_abs / INT6_MAX_VAL).clamp_min(1.0 / INT6_MAX_VAL)
+            clipped = torch.clamp(t32, -clip_abs[:, None], clip_abs[:, None])
+            q = torch.clamp(torch.round(clipped / scale[:, None]), -INT6_MAX_VAL, INT6_MAX_VAL).to(torch.int8)
+            # Compute reconstruction MSE
+            recon = q.float() * scale[:, None]
+            mse = (t32 - recon).pow(2).mean().item()
+            if mse < best_mse:
+                best_mse = mse
+                best_q = q.contiguous()
+                best_scale = scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+        return best_q, best_scale
+
+    # Vectors: simple per-tensor int6
+    clip_abs = float(t32.abs().max().item()) if t32.numel() else 0.0
+    scale = torch.tensor(clip_abs / INT6_MAX_VAL if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -INT6_MAX_VAL, INT6_MAX_VAL).to(torch.int8).contiguous()
+    return q, scale
+
+def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
+    """Int6 quantization for block weights, fp16 for embeddings."""
+    quantized: dict[str, Tensor] = {}
+    scales: dict[str, Tensor] = {}
+    dtypes: dict[str, str] = {}
+    passthrough: dict[str, Tensor] = {}
+    passthrough_orig_dtypes: dict[str, str] = {}
+    qmeta: dict[str, dict[str, object]] = {}
+    stats = dict.fromkeys(
+        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int6_payload_bytes"),
+        0,
+    )
+
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        stats["param_count"] += int(t.numel())
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
+
+        if not t.is_floating_point():
+            stats["num_nonfloat_tensors"] += 1
+            passthrough[name] = t
+            stats["int6_payload_bytes"] += tensor_nbytes(t)
+            continue
+
+        # Embeddings and small tensors: keep as fp16
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or "tok_emb" in name:
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["int6_payload_bytes"] += tensor_nbytes(kept)
+            continue
+
+        stats["num_float_tensors"] += 1
+        q, s = quantize_float_tensor_int6(t)
+        if s.ndim > 0:
+            qmeta[name] = {"scheme": "per_row", "axis": 0}
+        quantized[name] = q
+        scales[name] = s
+        dtypes[name] = str(t.dtype).removeprefix("torch.")
+        stats["int6_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+
+    obj: dict[str, object] = {
+        "__quant_format__": "int6_gptqlite_per_row_v1",
+        "quantized": quantized,
+        "scales": scales,
+        "dtypes": dtypes,
+        "passthrough": passthrough,
+    }
+    if qmeta:
+        obj["qmeta"] = qmeta
+    if passthrough_orig_dtypes:
+        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
+# --- QAT FAKE QUANTIZE ---
+def fake_quantize_int6(t: Tensor) -> Tensor:
+    """STE (Straight-Through Estimator) fake quantization for int6.
+    Forward: quantize+dequantize. Backward: gradient passes through unchanged."""
+    if t.ndim < 2:
+        return t
+    scale = t.abs().amax(dim=-1, keepdim=True) / INT6_MAX_VAL
+    scale = scale.clamp_min(1e-8)
+    q = torch.clamp(torch.round(t / scale), -INT6_MAX_VAL, INT6_MAX_VAL)
+    # STE: use q*scale in forward but let gradients flow through t
+    return t + (q * scale - t).detach()
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
@@ -496,6 +612,76 @@ class DistributedTokenLoader:
 # -----------------------------
 # TRANSFORMER MODULES
 # -----------------------------
+class PolarQuantizer(nn.Module):
+    """TurboQuant: Random Rotation + Lloyd-Max optimal scalar quantization.
+    
+    Stage 1 of TurboQuant (ICLR 2026): Random orthogonal rotation makes
+    coordinates follow a predictable Gaussian distribution, then Lloyd-Max
+    quantization minimizes MSE per coordinate.
+    """
+    def __init__(self, dim: int, bits: int = 4):
+        super().__init__()
+        self.dim = dim
+        self.bits = bits
+        # Random orthogonal rotation matrix (fixed, not learned)
+        rot = torch.empty(dim, dim)
+        torch.nn.init.orthogonal_(rot)
+        self.register_buffer("rotation", rot)
+        # Precompute Lloyd-Max codebook for Gaussian N(0, 1/sqrt(dim))
+        # These are optimal reconstruction levels for a Gaussian source
+        centroids, boundaries = self._compute_lloyd_max_codebook(bits, dim)
+        self.register_buffer("centroids", centroids)    # (num_levels,)
+        self.register_buffer("boundaries", boundaries)  # (num_levels-1,)
+
+    @staticmethod
+    def _compute_lloyd_max_codebook(bits: int, dim: int, iterations: int = 50):
+        """Compute optimal Lloyd-Max centroids for N(0, 1/sqrt(dim))."""
+        num_levels = 2 ** bits
+        sigma = 1.0 / math.sqrt(dim)
+        # Initialize with uniform quantile spacing
+        boundaries = torch.linspace(-3*sigma, 3*sigma, num_levels + 1)
+        centroids = (boundaries[:-1] + boundaries[1:]) / 2
+        # Lloyd's algorithm iterations for Gaussian
+        for _ in range(iterations):
+            # Update boundaries as midpoints of adjacent centroids
+            boundaries = torch.zeros(num_levels - 1)
+            for i in range(num_levels - 1):
+                boundaries[i] = (centroids[i] + centroids[i + 1]) / 2
+            # Update centroids as conditional expectations E[X | b_i <= X < b_{i+1}]
+            # For Gaussian, we use the truncated mean approximation
+            ext_bounds = torch.cat([torch.tensor([-float('inf')]), boundaries, torch.tensor([float('inf')])])
+            for i in range(num_levels):
+                lo, hi = ext_bounds[i].item(), ext_bounds[i + 1].item()
+                # Approximate E[X | lo <= X < hi] for N(0, sigma^2)
+                samples = torch.linspace(max(lo, -4*sigma), min(hi, 4*sigma), 1000)
+                weights = torch.exp(-0.5 * (samples / sigma) ** 2)
+                if weights.sum() > 0:
+                    centroids[i] = (samples * weights).sum() / weights.sum()
+        return centroids, boundaries
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Stage 1: Random rotation -> Gaussianize coordinates
+        x_rot = F.linear(x, self.rotation.to(x.dtype))
+        # Lloyd-Max quantization: find nearest centroid per coordinate
+        centroids = self.centroids.to(x.dtype)
+        # Compute distances to all centroids and pick nearest
+        dists = (x_rot.unsqueeze(-1) - centroids).abs()  # (..., dim, num_levels)
+        indices = dists.argmin(dim=-1)                     # (..., dim)
+        x_quant = centroids[indices]                       # (..., dim)
+        # Inverse rotation to reconstruct
+        return F.linear(x_quant, self.rotation.t().to(x.dtype))
+
+class QJLResidualCorrection(nn.Module):
+    """TurboQuant: 1-bit QJL Error Correction using signs."""
+    def __init__(self, dim: int, proj_dim: int = 128):
+        super().__init__()
+        jl_mat = torch.randn(dim, proj_dim) / math.sqrt(proj_dim)
+        self.register_buffer("jl", jl_mat)
+
+    def forward(self, residual: Tensor) -> Tensor:
+        p = torch.matmul(residual, self.jl.to(residual.dtype))
+        signs = torch.sign(p)
+        return torch.matmul(signs, self.jl.t().to(residual.dtype)) * math.sqrt(math.pi / 2.0)
 
 class RMSNorm(nn.Module):
     def __init__(self, eps: float | None = None):
@@ -508,9 +694,16 @@ class RMSNorm(nn.Module):
 
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    # QAT: optionally apply int6 fake-quantize during training for quantization-aware weights.
+    qat_active: bool = False  # Set by training loop when QAT phase begins
+
     def forward(self, x: Tensor) -> Tensor:
+        w = self.weight.to(x.dtype)
+        # QAT: simulate int6 quantization noise during training
+        if self.training and CastedLinear.qat_active and w.ndim == 2:
+            w = fake_quantize_int6(w)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w, bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -579,6 +772,11 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        # TurboQuant: PolarQuant + QJL for KV cache compression
+        self.polar_k = PolarQuantizer(self.head_dim)
+        self.qjl_k = QJLResidualCorrection(self.head_dim, proj_dim=self.head_dim)
+        self.polar_v = PolarQuantizer(self.head_dim)
+        self.qjl_v = QJLResidualCorrection(self.head_dim, proj_dim=self.head_dim)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -587,18 +785,28 @@ class CausalSelfAttention(nn.Module):
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
+
+        # --- TURBOQUANT COMPRESSION FOR KV CACHE ---
+        k_quant = self.polar_k(k)
+        k = k_quant + self.qjl_k(k - k_quant)
+
+        v_quant = self.polar_v(v)
+        v = v_quant + self.qjl_v(v - v_quant)
+        # --- END TURBOQUANT ---
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        if IS_WINDOWS:
+            # Windows: manual GQA expansion (enable_gqa requires Triton)
+            if self.num_kv_heads != self.num_heads:
+                repeat_factor = self.num_heads // self.num_kv_heads
+                k = k.repeat_interleave(repeat_factor, dim=1)
+                v = v.repeat_interleave(repeat_factor, dim=1)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+        else:
+            # Linux/H100: native GQA + FlashAttention
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True, enable_gqa=True)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -613,7 +821,7 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), negative_slope=0.5)
         return self.proj(x.square())
 
 
@@ -724,6 +932,39 @@ class GPT(nn.Module):
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
+class EMAWeightAverage:
+    """Exponential Moving Average of model weights for smoother final checkpoint."""
+    def __init__(self, model: nn.Module, decay: float = 0.997):
+        self.decay = decay
+        self.shadow: dict[str, Tensor] = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for name, param in model.named_parameters():
+            if name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(param.data, alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def apply(self, model: nn.Module) -> dict[str, Tensor]:
+        """Apply EMA weights to model, return original weights for restoration."""
+        originals = {}
+        for name, param in model.named_parameters():
+            if name in self.shadow:
+                originals[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+        return originals
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module, originals: dict[str, Tensor]) -> None:
+        """Restore original weights after EMA evaluation."""
+        for name, param in model.named_parameters():
+            if name in originals:
+                param.data.copy_(originals[name])
+
+
 # -----------------------------
 # TRAINING
 # -----------------------------
@@ -733,7 +974,10 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+
+    # torch.compile: only available on Linux (requires Triton)
+    if IS_LINUX:
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -763,10 +1007,18 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
-    enable_cudnn_sdp(False)
-    enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    if IS_WINDOWS:
+        # Windows: use math SDP as fallback (no FlashAttention/Triton)
+        enable_cudnn_sdp(False)
+        enable_flash_sdp(False)
+        enable_mem_efficient_sdp(False)
+        enable_math_sdp(True)
+    else:
+        # Linux/H100: FlashAttention for speed
+        enable_cudnn_sdp(False)
+        enable_flash_sdp(True)
+        enable_mem_efficient_sdp(False)
+        enable_math_sdp(False)
 
     logfile = None
     if master_process:
@@ -840,7 +1092,10 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    if IS_LINUX:
+        compiled_model = torch.compile(base_model)
+    else:
+        compiled_model = base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -862,10 +1117,11 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok = torch.optim.Adam(
+    optimizer_tok = torch.optim.AdamW(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.adam_weight_decay,
         fused=True,
     )
     optimizer_muon = Muon(
@@ -876,18 +1132,21 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
+        group["weight_decay"] = args.muon_weight_decay
+    optimizer_scalar = torch.optim.AdamW(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.adam_weight_decay,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
-        optimizer_head = torch.optim.Adam(
+        optimizer_head = torch.optim.AdamW(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
+            weight_decay=args.adam_weight_decay,
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
@@ -908,6 +1167,14 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+
+    # Initialize EMA weight averaging
+    ema: EMAWeightAverage | None = None
+    if args.ema_enabled:
+        ema = EMAWeightAverage(base_model, decay=args.ema_decay)
+        log0(f"ema_enabled:True ema_decay:{args.ema_decay}")
+    else:
+        log0("ema_enabled:False")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1006,6 +1273,14 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+
+        # Activate QAT after threshold (e.g. 15% of training)
+        if args.qat_enabled and not CastedLinear.qat_active:
+            qat_start = int(args.iterations * args.qat_late_threshold)
+            if step >= qat_start:
+                CastedLinear.qat_active = True
+                log0(f"QAT_ACTIVATED at step {step} (threshold={args.qat_late_threshold})")
+
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1032,6 +1307,10 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+
+        # EMA update every step
+        if ema is not None:
+            ema.update(base_model)
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1065,6 +1344,11 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
+    # Apply EMA weights before serialization if enabled
+    if ema is not None:
+        log0("Applying EMA weights for final evaluation and serialization...")
+        ema.apply(base_model)
+
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
@@ -1073,30 +1357,36 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
-    quant_buf = io.BytesIO()
-    torch.save(quant_obj, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
-    quant_raw_bytes = len(quant_raw)
+    # --- Int6 + LZMA artifact (primary submission format) ---
+    quant_obj6, quant_stats6 = quantize_state_dict_int6(base_model.state_dict())
+    quant_buf6 = io.BytesIO()
+    torch.save(quant_obj6, quant_buf6)
+    quant_raw6 = quant_buf6.getvalue()
+    quant_blob6 = lzma.compress(quant_raw6, preset=9)
+    quant_raw_bytes6 = len(quant_raw6)
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
-            f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        with open("final_model.int6.ptz", "wb") as f:
+            f.write(quant_blob6)
+        quant_file_bytes6 = os.path.getsize("final_model.int6.ptz")
         code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        ratio6 = quant_stats6["baseline_tensor_bytes"] / max(quant_stats6["int6_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            f"Serialized model int6+lzma: {quant_file_bytes6} bytes "
+            f"(payload:{quant_stats6['int6_payload_bytes']} raw_torch:{quant_raw_bytes6} payload_ratio:{ratio6:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        total_bytes = quant_file_bytes6 + code_bytes
+        log0(f"Total submission size int6+lzma: {total_bytes} bytes ({total_bytes / 1024 / 1024:.2f} MB)")
+        if total_bytes > 16_000_000:
+            log0(f"WARNING: Submission exceeds 16MB limit by {total_bytes - 16_000_000} bytes!")
+        else:
+            log0(f"Submission fits within 16MB limit ({16_000_000 - total_bytes} bytes remaining)")
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open("final_model.int6.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    quant_state = torch.load(io.BytesIO(lzma.decompress(quant_blob_disk)), map_location="cpu")
+    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)  # int6 uses same dequant format
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
@@ -1113,10 +1403,10 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_int6_lzma_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_int6_lzma_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
